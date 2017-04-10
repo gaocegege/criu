@@ -379,7 +379,7 @@ static int open_remap_dead_process(struct reg_file_info *rfi,
 {
 	struct pstree_item *helper;
 
-	helper = lookup_create_item(rfe->remap_id);
+	helper = lookup_create_item(rfe->remap_id, root_item->ids->pid_ns_id);
 	if (!helper)
 		return -1;
 
