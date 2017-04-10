@@ -209,7 +209,12 @@ struct pstree_item *__alloc_pstree_item(bool rst, int level)
 		if (!item)
 			return NULL;
 		item->pid = xmalloc(p_sz);
-		if (!item->pid) {
+		item->pgid = xmalloc(p_sz);
+		item->sid = xmalloc(p_sz);
+		if (!item->pid || !item->pgid || !item->sid) {
+			xfree(item->pid);
+			xfree(item->pgid);
+			xfree(item->sid);
 			xfree(item);
 			return NULL;
 		}
@@ -220,12 +225,17 @@ struct pstree_item *__alloc_pstree_item(bool rst, int level)
 			return NULL;
 		memset(item, 0, sz);
 		vm_area_list_init(&rsti(item)->vmas);
-
-		item->pid = shmalloc(p_sz);
+		/*
+		 * On restore we never expand pid level,
+		 * so allocate them all at once.
+		 */
+		item->pid = shmalloc(3 * p_sz);
 		if (!item->pid) {
 			shfree_last(item);
 			return NULL;
 		}
+		item->pgid = (void *)item->pid + p_sz;
+		item->sid = (void *)item->pgid + p_sz;
 	}
 
 	INIT_LIST_HEAD(&item->children);
@@ -237,7 +247,7 @@ struct pstree_item *__alloc_pstree_item(bool rst, int level)
 	item->born_sid = -1;
 	item->pid->item = item;
 	futex_init(&item->task_st);
-	item->pid->level = level;
+	item->pid->level = item->sid->level = item->pgid->level = level;
 
 	return item;
 }
@@ -300,7 +310,7 @@ int dump_pstree(struct pstree_item *root_item)
 	 * deeper in process tree, thus top-level checking for
 	 * leader is enough.
 	 */
-	if (vpid(root_item) != root_item->sid) {
+	if (!equal_pid(root_item->pid, root_item->sid)) {
 		if (!opts.shell_job) {
 			pr_err("The root process %d is not a session leader. "
 			       "Consider using --" OPT_SHELL_JOB " option\n", vpid(item));
@@ -317,8 +327,8 @@ int dump_pstree(struct pstree_item *root_item)
 
 		e.pid		= vpid(item);
 		e.ppid		= item->parent ? vpid(item->parent) : 0;
-		e.pgid		= item->pgid;
-		e.sid		= item->sid;
+		e.pgid		= item->pgid->ns[0].virt;
+		e.sid		= item->sid->ns[0].virt;
 		e.n_threads	= item->nr_threads;
 
 		e.threads = xmalloc(sizeof(e.threads[0]) * e.n_threads);
@@ -355,7 +365,7 @@ static int prepare_pstree_for_shell_job(void)
 	if (!opts.shell_job)
 		return 0;
 
-	if (root_item->sid == vpid(root_item))
+	if (equal_pid(root_item->sid, root_item->pid))
 		return 0;
 
 	/*
@@ -375,17 +385,17 @@ static int prepare_pstree_for_shell_job(void)
 	 * Not that clever solution but at least it works.
 	 */
 
-	old_sid = root_item->sid;
-	old_gid = root_item->pgid;
+	old_sid = root_item->sid->ns[0].virt;
+	old_gid = root_item->pgid->ns[0].virt;
 
 	pr_info("Migrating process tree (GID %d->%d SID %d->%d)\n",
 		old_gid, current_gid, old_sid, current_sid);
 
 	for_each_pstree_item(pi) {
-		if (pi->pgid == old_gid)
-			pi->pgid = current_gid;
-		if (pi->sid == old_sid)
-			pi->sid = current_sid;
+		if (pi->pgid->ns[0].virt == old_gid)
+			pi->pgid->ns[0].virt = current_gid;
+		if (pi->sid->ns[0].virt == old_sid)
+			pi->sid->ns[0].virt = current_sid;
 	}
 
 	if (lookup_create_item(current_sid) == NULL)
@@ -558,10 +568,10 @@ static int read_pstree_image(pid_t *pid_max)
 		pi->pid->ns[0].virt = e->pid;
 		if (e->pid > *pid_max)
 			*pid_max = e->pid;
-		pi->pgid = e->pgid;
+		pi->pgid->ns[0].virt = e->pgid;
 		if (e->pgid > *pid_max)
 			*pid_max = e->pgid;
-		pi->sid = e->sid;
+		pi->sid->ns[0].virt = e->sid;
 		if (e->sid > *pid_max)
 			*pid_max = e->sid;
 		pi->pid->state = TASK_ALIVE;
@@ -599,6 +609,7 @@ static int read_pstree_image(pid_t *pid_max)
 		for (i = 0; i < e->n_threads; i++) {
 			struct pid *node;
 			pi->threads[i].real = -1;
+			pi->threads[i].level = pi->pid->level;
 			pi->threads[i].ns[0].virt = e->threads[i];
 			pi->threads[i].state = TASK_THREAD;
 			pi->threads[i].item = NULL;
@@ -678,10 +689,10 @@ static int prepare_pstree_ids(void)
 		 * a session leader himself -- this is a simple case, we
 		 * just proceed in a normal way.
 		 */
-		if (item->sid == root_item->sid || item->sid == vpid(item))
+		if (equal_pid(item->sid, root_item->sid) || equal_pid(item->sid, item->pid))
 			continue;
 
-		leader = pstree_item_by_virt(item->sid);
+		leader = pstree_item_by_virt(item->sid->ns[0].virt);
 		BUG_ON(leader == NULL);
 		if (leader->pid->state != TASK_UNDEF) {
 			pid_t pid;
@@ -693,10 +704,10 @@ static int prepare_pstree_ids(void)
 			if (helper == NULL)
 				return -1;
 
-			pr_info("Session leader %d\n", item->sid);
+			pr_info("Session leader %d\n", item->sid->ns[0].virt);
 
-			helper->sid = item->sid;
-			helper->pgid = leader->pgid;
+			helper->sid->ns[0].virt = item->sid->ns[0].virt;
+			helper->pgid->ns[0].virt = leader->pgid->ns[0].virt;
 			helper->ids = leader->ids;
 			helper->parent = leader;
 			list_add(&helper->sibling, &leader->children);
@@ -705,8 +716,8 @@ static int prepare_pstree_ids(void)
 					vpid(helper), vpid(leader));
 		} else {
 			helper = leader;
-			helper->sid = item->sid;
-			helper->pgid = item->sid;
+			helper->sid->ns[0].virt = item->sid->ns[0].virt;
+			helper->pgid->ns[0].virt = item->sid->ns[0].virt;
 			helper->parent = root_item;
 			helper->ids = root_item->ids;
 			list_add_tail(&helper->sibling, &helpers);
@@ -714,7 +725,7 @@ static int prepare_pstree_ids(void)
 		init_pstree_helper(helper);
 
 		pr_info("Add a helper %d for restoring SID %d\n",
-				vpid(helper), helper->sid);
+				vpid(helper), helper->sid->ns[0].virt);
 
 		child = list_entry(item->sibling.prev, struct pstree_item, sibling);
 		item = child;
@@ -723,9 +734,9 @@ static int prepare_pstree_ids(void)
 		 * Stack on helper task all children with target sid.
 		 */
 		list_for_each_entry_safe_continue(child, tmp, &root_item->children, sibling) {
-			if (child->sid != helper->sid)
+			if (!equal_pid(child->sid, helper->sid))
 				continue;
-			if (child->sid == vpid(child))
+			if (equal_pid(child->sid, child->pid))
 				continue;
 
 			pr_info("Attach %d to the temporary task %d\n",
@@ -744,28 +755,28 @@ static int prepare_pstree_ids(void)
 		if (item->pid->state == TASK_HELPER)
 			continue;
 
-		if (item->sid != vpid(item)) {
+		if (!equal_pid(item->sid, item->pid)) {
 			struct pstree_item *parent;
 
-			if (item->parent->sid == item->sid)
+			if (equal_pid(item->parent->sid, item->sid))
 				continue;
 
 			/* the task could fork a child before and after setsid() */
 			parent = item->parent;
-			while (parent && vpid(parent) != item->sid) {
-				if (parent->born_sid != -1 && parent->born_sid != item->sid) {
+			while (parent && !equal_pid(parent->pid, item->sid)) {
+				if (parent->born_sid != -1 && parent->born_sid != item->sid->ns[0].virt) {
 					pr_err("Can't figure out which sid (%d or %d)"
 						"the process %d was born with\n",
-						parent->born_sid, item->sid, vpid(parent));
+						parent->born_sid, item->sid->ns[0].virt, vpid(parent));
 					return -1;
 				}
-				parent->born_sid = item->sid;
-				pr_info("%d was born with sid %d\n", vpid(parent), item->sid);
+				parent->born_sid = item->sid->ns[0].virt;
+				pr_info("%d was born with sid %d\n", vpid(parent), item->sid->ns[0].virt);
 				parent = parent->parent;
 			}
 
 			if (parent == NULL) {
-				pr_err("Can't find a session leader for %d\n", item->sid);
+				pr_err("Can't find a session leader for %d\n", item->sid->ns[0].virt);
 				return -1;
 			}
 
@@ -780,10 +791,10 @@ static int prepare_pstree_ids(void)
 	for_each_pstree_item(item) {
 		struct pid *pid;
 
-		if (!item->pgid || vpid(item) == item->pgid)
+		if (!item->pgid || equal_pid(item->pid, item->pgid))
 			continue;
 
-		pid = pstree_pid_by_virt(item->pgid);
+		pid = pstree_pid_by_virt(item->pgid->ns[0].virt);
 		if (pid->state != TASK_UNDEF) {
 			BUG_ON(pid->state == TASK_THREAD);
 			rsti(item)->pgrp_leader = pid->item;
@@ -795,22 +806,22 @@ static int prepare_pstree_ids(void)
 		 * means we're inheriting group from the current
 		 * task so we need to escape creating a helper here.
 		 */
-		if (current_pgid == item->pgid)
+		if (current_pgid == item->pgid->ns[0].virt)
 			continue;
 
 		helper = pid->item;
 		init_pstree_helper(helper);
 
-		helper->sid = item->sid;
-		helper->pgid = item->pgid;
-		helper->pid->ns[0].virt = item->pgid;
+		helper->sid->ns[0].virt = item->sid->ns[0].virt;
+		helper->pgid->ns[0].virt = item->pgid->ns[0].virt;
+		helper->pid->ns[0].virt = item->pgid->ns[0].virt;
 		helper->parent = item;
 		helper->ids = item->ids;
 		list_add(&helper->sibling, &item->children);
 		rsti(item)->pgrp_leader = helper;
 
 		pr_info("Add a helper %d for restoring PGID %d\n",
-				vpid(helper), helper->pgid);
+				vpid(helper), helper->pgid->ns[0].virt);
 	}
 
 	return 0;
@@ -1027,7 +1038,7 @@ int prepare_dummy_pstree(void)
 
 bool restore_before_setsid(struct pstree_item *child)
 {
-	int csid = child->born_sid == -1 ? child->sid : child->born_sid;
+	int csid = child->born_sid == -1 ? child->sid->ns[0].virt : child->born_sid;
 
 	if (child->parent->born_sid == csid)
 		return true;
