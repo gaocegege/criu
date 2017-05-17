@@ -164,6 +164,9 @@ include/common/asm: include/common/arch/$(ARCH)/asm
 
 criu-deps	+= include/common/asm
 
+scripts/check_pid: scripts/check_pid.c
+	$(Q) $(CC) $< -o $@
+
 #
 # Configure variables.
 export CONFIG_HEADER := criu/include/config.h
@@ -256,6 +259,7 @@ mrproper-top: clean-top
 	$(Q) $(RM) compel/include/asm
 	$(Q) $(RM) cscope.*
 	$(Q) $(RM) tags TAGS
+	$(Q) $(RM) scripts/check_pid
 .PHONY: mrproper-top
 
 mrproper: mrproper-top
